@@ -1,0 +1,8 @@
+#include "klib/new.hpp"
+#include "system/idt/idt.hpp"
+#include "system/stack.hpp"
+#include "memory/memory.hpp"
+#include "memory/kmalloc.hpp"
+#include "memory/pmm/pmm.hpp"
+#include "memory/vmm/vmm.hpp"
+#include "memory/paging/paging.hpp"
