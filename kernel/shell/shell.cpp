@@ -498,16 +498,19 @@ static void run_pipeline(const char* input) {
         // trim trailing spaces from left
         while (i > 0 && left[i-1] == ' ') left[--i] = 0;
 
-        int file_fd = fat12_create(right);
+        if (left[0] == 0) { shell_puts("syntax: missing command before >", COL_ERR); fb_present(); return; }
+        if (right[0] == 0) { shell_puts("syntax: missing filename after >", COL_ERR); fb_present(); return; }
+
+        int file_fd = fd_create(right);
         if (file_fd < 0 && has_lower_alpha(right)) {
             char up[256]; upper_path(up, right);
-            file_fd = fat12_create(up);
+            file_fd = fd_create(up);
         }
         if (file_fd < 0) { shell_puts("redirect: cannot create file", COL_ERR); fb_present(); return; }
         g_out_fd = file_fd;
         dispatch(left);
         g_out_fd = -1;
-        fat12_close(file_fd);
+        fd_close(file_fd);
         fb_present();
         return;
     }
@@ -524,6 +527,9 @@ static void run_pipeline(const char* input) {
         while (input[j] && k < 255) { right[k++] = input[j++]; }
         right[k] = 0;
         while (i > 0 && left[i-1] == ' ') left[--i] = 0;
+
+        if (left[0] == 0) { shell_puts("syntax: missing command before |", COL_ERR); fb_present(); return; }
+        if (right[0] == 0) { shell_puts("syntax: missing command after |", COL_ERR); fb_present(); return; }
 
         int rfd, wfd;
         if (!fd_pipe(&rfd, &wfd)) { shell_puts("pipe: failed", COL_ERR); fb_present(); return; }
@@ -567,15 +573,15 @@ static void run_pipeline(const char* input) {
     fname[p] = 0;
     while (m > 0 && cmd2[m-1] == ' ') cmd2[--m] = 0;
 
-    int file_fd = fat12_create(fname);
+    int file_fd = fd_create(fname);
     if (file_fd < 0 && has_lower_alpha(fname)) {
         char up[256]; upper_path(up, fname);
-        file_fd = fat12_create(up);
+        file_fd = fd_create(up);
     }
     if (file_fd < 0) { shell_puts("redirect: cannot create file", COL_ERR); fb_present(); return; }
 
     int rfd, wfd;
-    if (!fd_pipe(&rfd, &wfd)) { shell_puts("pipe: failed", COL_ERR); fat12_close(file_fd); fb_present(); return; }
+    if (!fd_pipe(&rfd, &wfd)) { shell_puts("pipe: failed", COL_ERR); fd_close(file_fd); fb_present(); return; }
 
     // Run left: output -> pipe
     g_out_fd = wfd;
@@ -590,7 +596,7 @@ static void run_pipeline(const char* input) {
     g_in_fd = -1;
     g_out_fd = -1;
     fd_close(rfd);
-    fat12_close(file_fd);
+    fd_close(file_fd);
     fb_present();
 }
 
