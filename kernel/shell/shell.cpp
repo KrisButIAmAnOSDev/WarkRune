@@ -13,6 +13,7 @@
 #include "system/pit/pit.hpp"
 #include "system/cpuid/cpuid.hpp"
 #include "system/syscall/syscall.hpp"
+#include "system/ipc/fd.hpp"
 #include "klib/str.h"
 #include "klib/color.hpp"
 #include "memory/memory.hpp"
@@ -34,6 +35,8 @@
 
 static char cwd[256] = "/";
 static bool g_serial_mode = false;
+static int  g_out_fd = -1;  // -1 = screen, else FD to write to (pipe/file)
+static int  g_in_fd  = -1;  // -1 = keyboard, else FD to read from (pipe)
 static int32_t last_cx = -1, last_cy = -1;
 
 // Cursor sprite footprint: 8 wide x 12 tall
@@ -90,6 +93,11 @@ static void update_cursor() {
 }
 
 static void shell_puts(const char* s, uint32_t color) {
+    if (g_out_fd >= 0) {
+        fd_write(g_out_fd, s, (uint32_t)str_len(s));
+        fd_write(g_out_fd, "\n", 1);
+        return;
+    }
     if (!g_serial_mode) {
         if (get_y() + CHAR_H > SCREEN_H) {
             fill_screen(COL_BG);
@@ -398,7 +406,21 @@ static void dispatch(const char* input) {
     }
 
     if (str_eq(cmd, "cat")) {
-        if (!args || args[0] == 0) { shell_puts("usage: cat <file>", COL_ERR); fb_present(); return; }
+        if (!args || args[0] == 0) {
+            // No file: read from stdin (pipe or keyboard)
+            if (g_in_fd >= 0) {
+                char buf[512];
+                int n;
+                while ((n = fd_read(g_in_fd, buf, sizeof(buf) - 1)) > 0) {
+                    buf[n] = 0;
+                    shell_puts(buf, COL_FG);
+                }
+            } else {
+                shell_puts("usage: cat <file>", COL_ERR);
+            }
+            fb_present();
+            return;
+        }
         char path[256];
         build_path(path, args);
         int fd = fat12_open(path);
@@ -419,6 +441,13 @@ static void dispatch(const char* input) {
         return;
     }
 
+    if (str_eq(cmd, "echo")) {
+        if (args) shell_puts(args, COL_FG);
+        else shell_puts("", COL_FG);
+        fb_present();
+        return;
+    }
+
     if (str_eq(cmd, "exec")) { cmd_exec(args); fb_present(); return; }
 
     for (int j = 0; j < N_CMDS; j++) {
@@ -435,6 +464,136 @@ static void dispatch(const char* input) {
     fb_present();
 }
 
+// Find first occurrence of '|' or '>' outside of any context.
+// Returns the position, or -1 if not found.
+static int find_op(const char* s, char op) {
+    for (int i = 0; s[i]; i++) {
+        if (s[i] == op) return i;
+    }
+    return -1;
+}
+
+static void run_pipeline(const char* input) {
+    int pipe_pos  = find_op(input, '|');
+    int redir_pos = find_op(input, '>');
+
+    // No pipe, no redirect: just run the command
+    if (pipe_pos < 0 && redir_pos < 0) {
+        dispatch(input);
+        return;
+    }
+
+    // Only redirect: "cmd > file"
+    if (pipe_pos < 0) {
+        char left[256], right[256];
+        int i = 0;
+        while (i < redir_pos && i < 255) { left[i] = input[i]; i++; }
+        left[i] = 0;
+        // skip spaces after '>'
+        int j = redir_pos + 1;
+        while (input[j] == ' ') j++;
+        int k = 0;
+        while (input[j] && k < 255) { right[k++] = input[j++]; }
+        right[k] = 0;
+        // trim trailing spaces from left
+        while (i > 0 && left[i-1] == ' ') left[--i] = 0;
+
+        int file_fd = fat12_create(right);
+        if (file_fd < 0 && has_lower_alpha(right)) {
+            char up[256]; upper_path(up, right);
+            file_fd = fat12_create(up);
+        }
+        if (file_fd < 0) { shell_puts("redirect: cannot create file", COL_ERR); fb_present(); return; }
+        g_out_fd = file_fd;
+        dispatch(left);
+        g_out_fd = -1;
+        fat12_close(file_fd);
+        fb_present();
+        return;
+    }
+
+    // Only pipe: "cmd1 | cmd2"
+    if (redir_pos < 0) {
+        char left[256], right[256];
+        int i = 0;
+        while (i < pipe_pos && i < 255) { left[i] = input[i]; i++; }
+        left[i] = 0;
+        int j = pipe_pos + 1;
+        while (input[j] == ' ') j++;
+        int k = 0;
+        while (input[j] && k < 255) { right[k++] = input[j++]; }
+        right[k] = 0;
+        while (i > 0 && left[i-1] == ' ') left[--i] = 0;
+
+        int rfd, wfd;
+        if (!fd_pipe(&rfd, &wfd)) { shell_puts("pipe: failed", COL_ERR); fb_present(); return; }
+
+        g_out_fd = wfd;
+        dispatch(left);
+        g_out_fd = -1;
+        fd_close(wfd);
+
+        g_in_fd = rfd;
+        dispatch(right);
+        g_in_fd = -1;
+        fd_close(rfd);
+        fb_present();
+        return;
+    }
+
+    // Both pipe and redirect: "cmd1 | cmd2 > file"
+    // Run cmd1 (writes to pipe), then cmd2 (reads from pipe, writes to file)
+    char left[256], rest[256];
+    int i = 0;
+    while (i < pipe_pos && i < 255) { left[i] = input[i]; i++; }
+    left[i] = 0;
+    int j = pipe_pos + 1;
+    while (input[j] == ' ') j++;
+    int k = 0;
+    while (input[j] && k < 255) { rest[k++] = input[j++]; }
+    rest[k] = 0;
+    while (i > 0 && left[i-1] == ' ') left[--i] = 0;
+
+    // Now split rest by '>'
+    int rp = find_op(rest, '>');
+    char cmd2[256], fname[256];
+    int m = 0;
+    while (m < rp && m < 255) { cmd2[m] = rest[m]; m++; }
+    cmd2[m] = 0;
+    int n = rp + 1;
+    while (rest[n] == ' ') n++;
+    int p = 0;
+    while (rest[n] && p < 255) { fname[p++] = rest[n++]; }
+    fname[p] = 0;
+    while (m > 0 && cmd2[m-1] == ' ') cmd2[--m] = 0;
+
+    int file_fd = fat12_create(fname);
+    if (file_fd < 0 && has_lower_alpha(fname)) {
+        char up[256]; upper_path(up, fname);
+        file_fd = fat12_create(up);
+    }
+    if (file_fd < 0) { shell_puts("redirect: cannot create file", COL_ERR); fb_present(); return; }
+
+    int rfd, wfd;
+    if (!fd_pipe(&rfd, &wfd)) { shell_puts("pipe: failed", COL_ERR); fat12_close(file_fd); fb_present(); return; }
+
+    // Run left: output -> pipe
+    g_out_fd = wfd;
+    dispatch(left);
+    g_out_fd = -1;
+    fd_close(wfd);
+
+    // Run cmd2: input from pipe, output -> file
+    g_in_fd = rfd;
+    g_out_fd = file_fd;
+    dispatch(cmd2);
+    g_in_fd = -1;
+    g_out_fd = -1;
+    fd_close(rfd);
+    fat12_close(file_fd);
+    fb_present();
+}
+
 static void cmd_help() {
     shell_puts("commands:", COL_INFO);
     for (int i = 0; i < N_CMDS; i++) {
@@ -442,8 +601,9 @@ static void cmd_help() {
         ksnprintf(line, sizeof(line), "  %-12s %s", cmds[i].name, cmds[i].desc);
         shell_puts(line, COL_FG);
     }
-    shell_puts("  ls [path]    cat <file>   cd <path>", COL_FG);
+    shell_puts("  ls [path]    cat <file>   cd <path>   echo <text>", COL_FG);
     shell_puts("  pwd          mkdir        touch   rm   rmdir", COL_FG);
+    shell_puts("  pipes (|) and redirects (>) are supported", COL_INFO);
 }
 
 static void cmd_clear() {
@@ -704,7 +864,7 @@ extern "C" void shell_run(int start_y) {
     while (1) {
         char buf[CMD_BUF];
         shell_readline(buf, CMD_BUF);
-        dispatch(buf);
+        run_pipeline(buf);
         fb_present();
     }
 }
@@ -724,7 +884,7 @@ extern "C" void serial_shell_poll(char c) {
         serial_putc('\n');
         if (len > 0) {
             g_serial_mode = true;
-            dispatch(buf);
+            run_pipeline(buf);
             g_serial_mode = false;
         }
         len = 0;
