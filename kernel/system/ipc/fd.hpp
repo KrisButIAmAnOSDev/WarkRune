@@ -34,6 +34,7 @@ struct FileDesc {
 void fd_init();
 int  fd_open(const char* path);
 int  fd_create(const char* path);
+int  fd_create_case(const char* path);  // tries original then uppercased
 int  fd_read(int fd, void* buf, uint32_t size);
 int  fd_write(int fd, const void* buf, uint32_t size);
 void fd_close(int fd);

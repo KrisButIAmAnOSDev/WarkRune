@@ -63,6 +63,11 @@ struct DirEntry {
 #define ATTR_ARCH  0x20
 #define ATTR_LFN   0x0F
 
+// Directory entry first-byte markers
+#define DIR_END    0x00   // no more entries
+#define DIR_FREE   0xE5   // entry was deleted
+#define SUBDIR_MAX_ENTS 10000
+
 // FAT12 special cluster values
 #define FAT12_FREE     0x000
 #define FAT12_RESERVED 0x001
@@ -101,6 +106,27 @@ struct FD {
 
 static FD g_fds[FAT12_MAX_FDS];
 
+static bool fd_is_valid(int fd) {
+    return fd >= 0 && fd < FAT12_MAX_FDS && g_fds[fd].used;
+}
+
+static int fd_alloc(uint16_t first_cluster, uint32_t size,
+                    uint16_t parent_cluster, int dir_idx) {
+    for (int fd = 0; fd < FAT12_MAX_FDS; fd++) {
+        if (!g_fds[fd].used) {
+            FD& f = g_fds[fd];
+            f.used           = true;
+            f.first_cluster  = first_cluster;
+            f.size           = size;
+            f.pos            = 0;
+            f.parent_cluster = parent_cluster;
+            f.dir_idx        = dir_idx;
+            return fd;
+        }
+    }
+    return -1;
+}
+
 // ============================================================
 // Low-level disk I/O
 // ============================================================
@@ -119,6 +145,13 @@ static bool write_sector(uint32_t lba) {
 
 static uint32_t cluster_lba(uint16_t cluster) {
     return g_data_lba + (uint32_t)(cluster - 2) * g_sec_per_clus;
+}
+
+static void zero_cluster(uint16_t cluster) {
+    for (int i = 0; i < 512; i++) g_buf[i] = 0;
+    uint32_t clba = cluster_lba(cluster);
+    for (uint32_t s = 0; s < g_sec_per_clus; s++)
+        ata_write(clba + s, 1, (uint16_t*)g_buf);
 }
 
 static uint32_t cluster_size() {
@@ -380,15 +413,15 @@ static bool dir_write_entry(uint32_t dir_start_lba, uint16_t dir_cluster,
 }
 
 // Find the total number of entries in a directory (root or subdir).
-// Stops at the first free (0x00) entry.
+// Stops at the first free (DIR_END) entry.
 static int dir_count_entries(uint32_t dir_start_lba, uint16_t dir_cluster) {
     DirEntry e;
     int count = 0;
-    int max = (dir_cluster == 0) ? g_root_entries : 10000;
+    int max = (dir_cluster == 0) ? g_root_entries : SUBDIR_MAX_ENTS;
     for (int i = 0; i < max; i++) {
         if (!dir_read_entry(dir_start_lba, dir_cluster, i, &e)) break;
-        if ((uint8_t)e.name[0] == 0x00) break;  // end of dir
-        if ((uint8_t)e.name[0] == 0xE5) continue; // deleted
+        if ((uint8_t)e.name[0] == DIR_END) break;  // end of dir
+        if ((uint8_t)e.name[0] == DIR_FREE) continue; // deleted
         count++;
     }
     return count;
@@ -438,11 +471,11 @@ static bool resolve_path(const char* path, uint16_t* dir_cluster,
         // Search current directory for this component
         DirEntry e;
         bool found = false;
-        uint32_t max_ents = (*dir_cluster == 0) ? g_root_entries : 10000;
+        uint32_t max_ents = (*dir_cluster == 0) ? g_root_entries : SUBDIR_MAX_ENTS;
         for (int i = 0; i < (int)max_ents; i++) {
             if (!dir_read_entry(g_root_lba, *dir_cluster, i, &e)) break;
-            if ((uint8_t)e.name[0] == 0x00) break;
-            if ((uint8_t)e.name[0] == 0xE5) continue;
+            if ((uint8_t)e.name[0] == DIR_END) break;
+            if ((uint8_t)e.name[0] == DIR_FREE) continue;
             if (e.attr & ATTR_LFN) continue;
             if (!match_83(e.name, target)) continue;
             if (!(e.attr & ATTR_DIR)) return false;
@@ -463,12 +496,12 @@ static bool resolve_path(const char* path, uint16_t* dir_cluster,
 static int find_in_dir(uint16_t dir_cluster, const char target_83[11],
                         DirEntry* out, int* out_idx)
 {
-    uint32_t max_ents = (dir_cluster == 0) ? g_root_entries : 10000;
+    uint32_t max_ents = (dir_cluster == 0) ? g_root_entries : SUBDIR_MAX_ENTS;
     for (int i = 0; i < (int)max_ents; i++) {
         DirEntry e;
         if (!dir_read_entry(g_root_lba, dir_cluster, i, &e)) break;
-        if ((uint8_t)e.name[0] == 0x00) break;
-        if ((uint8_t)e.name[0] == 0xE5) continue;
+        if ((uint8_t)e.name[0] == DIR_END) break;
+        if ((uint8_t)e.name[0] == DIR_FREE) continue;
         if (e.attr & ATTR_LFN) continue;
         if (!match_83(e.name, target_83)) continue;
         if (out) *out = e;
@@ -485,12 +518,12 @@ static int find_in_dir(uint16_t dir_cluster, const char target_83[11],
 
 // Allocate a free directory entry slot.  Returns absolute entry index, or -1.
 static int alloc_dir_entry(uint16_t dir_cluster) {
-    uint32_t max_ents = (dir_cluster == 0) ? g_root_entries : 10000;
+    uint32_t max_ents = (dir_cluster == 0) ? g_root_entries : SUBDIR_MAX_ENTS;
     for (int i = 0; i < (int)max_ents; i++) {
         DirEntry e;
         if (!dir_read_entry(g_root_lba, dir_cluster, i, &e)) break;
         uint8_t first = (uint8_t)e.name[0];
-        if (first == 0x00 || first == 0xE5) return i;
+        if (first == DIR_END || first == DIR_FREE) return i;
     }
 
     // For subdirectories, extend the chain
@@ -505,12 +538,7 @@ static int alloc_dir_entry(uint16_t dir_cluster) {
         uint16_t new_clus = fat_alloc();
         if (!new_clus) return -1;
         fat_set(clus, new_clus);
-
-        for (int i = 0; i < 512; i++) g_buf[i] = 0;
-        uint32_t clba = cluster_lba(new_clus);
-        for (uint32_t s = 0; s < g_sec_per_clus; s++)
-            ata_write(clba + s, 1, (uint16_t*)g_buf);
-
+        zero_cluster(new_clus);
         return (int)max_ents;
     }
 
@@ -592,18 +620,7 @@ int fat12_open(const char* path) {
     if (idx < 0) return -1;
     if (e.attr & ATTR_DIR) return -1;
 
-    for (int fd = 0; fd < FAT12_MAX_FDS; fd++) {
-        if (!g_fds[fd].used) {
-            g_fds[fd].used          = true;
-            g_fds[fd].first_cluster = e.first_cluster;
-            g_fds[fd].size          = e.file_size;
-            g_fds[fd].pos           = 0;
-            g_fds[fd].parent_cluster = dir_cluster;
-            g_fds[fd].dir_idx       = idx;
-            return fd;
-        }
-    }
-    return -1;
+    return fd_alloc(e.first_cluster, e.file_size, dir_cluster, idx);
 }
 
 // ============================================================
@@ -631,18 +648,7 @@ int fat12_create(const char* path) {
 
     if (!dir_write_entry(g_root_lba, dir_cluster, idx, &e)) return -1;
 
-    for (int fd = 0; fd < FAT12_MAX_FDS; fd++) {
-        if (!g_fds[fd].used) {
-            g_fds[fd].used          = true;
-            g_fds[fd].first_cluster = 0;
-            g_fds[fd].size          = 0;
-            g_fds[fd].pos           = 0;
-            g_fds[fd].parent_cluster = dir_cluster;
-            g_fds[fd].dir_idx       = idx;
-            return fd;
-        }
-    }
-    return -1;
+    return fd_alloc(0, 0, dir_cluster, idx);
 }
 
 // ============================================================
@@ -650,7 +656,7 @@ int fat12_create(const char* path) {
 // ============================================================
 
 int fat12_read(int fd, void* buf, uint32_t size) {
-    if (fd < 0 || fd >= FAT12_MAX_FDS || !g_fds[fd].used) return -1;
+    if (!fd_is_valid(fd)) return -1;
     FD& f = g_fds[fd];
 
     if (f.pos >= f.size) return 0;
@@ -705,7 +711,7 @@ int fat12_read(int fd, void* buf, uint32_t size) {
 // ============================================================
 
 int fat12_write(int fd, const void* buf, uint32_t size) {
-    if (fd < 0 || fd >= FAT12_MAX_FDS || !g_fds[fd].used) return -1;
+    if (!fd_is_valid(fd)) return -1;
     FD& f = g_fds[fd];
     if (size == 0) return 0;
 
@@ -718,11 +724,7 @@ int fat12_write(int fd, const void* buf, uint32_t size) {
         uint16_t new_clus = fat_alloc();
         if (!new_clus) return -1;
         f.first_cluster = new_clus;
-        // Zero the new cluster
-        for (int i = 0; i < 512; i++) g_buf[i] = 0;
-        uint32_t clba = cluster_lba(new_clus);
-        for (uint32_t s = 0; s < g_sec_per_clus; s++)
-            ata_write(clba + s, 1, (uint16_t*)g_buf);
+        zero_cluster(new_clus);
     }
 
     // Navigate to cluster containing pos, extending chain as needed
@@ -734,11 +736,7 @@ int fat12_write(int fd, const void* buf, uint32_t size) {
             next = fat_alloc();
             if (!next) return (int)done;
             fat_set(clus, next);
-            // Zero new cluster
-            for (int j = 0; j < 512; j++) g_buf[j] = 0;
-            uint32_t clba = cluster_lba(next);
-            for (uint32_t s = 0; s < g_sec_per_clus; s++)
-                ata_write(clba + s, 1, (uint16_t*)g_buf);
+            zero_cluster(next);
         }
         clus = (next >= FAT12_EOC) ? 0 : next;
         if (clus == 0) return (int)done;
@@ -771,10 +769,7 @@ int fat12_write(int fd, const void* buf, uint32_t size) {
                 next = fat_alloc();
                 if (!next) break;
                 fat_set(clus, next);
-                for (int j = 0; j < 512; j++) g_buf[j] = 0;
-                uint32_t clba2 = cluster_lba(next);
-                for (uint32_t ss = 0; ss < g_sec_per_clus; ss++)
-                    ata_write(clba2 + ss, 1, (uint16_t*)g_buf);
+                zero_cluster(next);
             }
             clus = next;
         }
@@ -790,7 +785,7 @@ int fat12_write(int fd, const void* buf, uint32_t size) {
 // ============================================================
 
 void fat12_flush(int fd) {
-    if (fd < 0 || fd >= FAT12_MAX_FDS || !g_fds[fd].used) return;
+    if (!fd_is_valid(fd)) return;
     FD& f = g_fds[fd];
 
     DirEntry e;
@@ -817,7 +812,7 @@ void fat12_close(int fd) {
 // ============================================================
 
 int fat12_size(int fd) {
-    if (fd < 0 || fd >= FAT12_MAX_FDS || !g_fds[fd].used) return -1;
+    if (!fd_is_valid(fd)) return -1;
     return (int)g_fds[fd].size;
 }
 
@@ -841,7 +836,7 @@ bool fat12_delete(const char* path) {
         fat_free_chain(e.first_cluster);
 
     // Mark directory entry as deleted
-    e.name[0] = (char)0xE5;
+    e.name[0] = (char)DIR_FREE;
 
     // Re-derive directory entry location
     if (dir_cluster == 0) {
@@ -904,10 +899,7 @@ bool fat12_mkdir(const char* path) {
     if (!new_clus) return false;
 
     // Zero the new cluster (empty directory)
-    for (int i = 0; i < 512; i++) g_buf[i] = 0;
-    uint32_t clba = cluster_lba(new_clus);
-    for (uint32_t s = 0; s < g_sec_per_clus; s++)
-        ata_write(clba + s, 1, (uint16_t*)g_buf);
+    zero_cluster(new_clus);
 
     // Create the directory entry in the parent
     int idx = alloc_dir_entry(dir_cluster);
@@ -943,11 +935,11 @@ bool fat12_rmdir(const char* path) {
 
     // Check that the directory is empty
     DirEntry child;
-    uint32_t max_ents = (e.first_cluster == 0) ? g_root_entries : 10000;
+    uint32_t max_ents = (e.first_cluster == 0) ? g_root_entries : SUBDIR_MAX_ENTS;
     for (int i = 0; i < (int)max_ents; i++) {
         if (!dir_read_entry(g_root_lba, e.first_cluster, i, &child)) break;
-        if ((uint8_t)child.name[0] == 0x00) break;
-        if ((uint8_t)child.name[0] == 0xE5) continue;
+        if ((uint8_t)child.name[0] == DIR_END) break;
+        if ((uint8_t)child.name[0] == DIR_FREE) continue;
         if (child.attr & ATTR_LFN) continue;
         // . and .. entries
         if (child.name[0] == '.' && (child.name[1] == ' ' || (child.name[1] == '.' && child.name[2] == ' ')))
@@ -960,7 +952,7 @@ bool fat12_rmdir(const char* path) {
         fat_free_chain(e.first_cluster);
 
     // Mark entry as deleted
-    e.name[0] = (char)0xE5;
+    e.name[0] = (char)DIR_FREE;
     return dir_write_entry(g_root_lba, dir_cluster, idx, &e);
 }
 
@@ -988,11 +980,11 @@ bool fat12_ls(const char* path,
     }
 
     DirEntry e;
-    uint32_t max_ents = (dir_cluster == 0) ? g_root_entries : 10000;
+    uint32_t max_ents = (dir_cluster == 0) ? g_root_entries : SUBDIR_MAX_ENTS;
     for (int i = 0; i < (int)max_ents; i++) {
         if (!dir_read_entry(g_root_lba, dir_cluster, i, &e)) break;
-        if ((uint8_t)e.name[0] == 0x00) break;
-        if ((uint8_t)e.name[0] == 0xE5) continue;
+        if ((uint8_t)e.name[0] == DIR_END) break;
+        if ((uint8_t)e.name[0] == DIR_FREE) continue;
         if (e.attr & ATTR_LFN) continue;
 
         // Skip . and .. in subdirectories

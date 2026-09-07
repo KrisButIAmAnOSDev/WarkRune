@@ -81,6 +81,25 @@ int fd_create(const char* path) {
     return fd;
 }
 
+int fd_create_case(const char* path) {
+    int fd = fd_create(path);
+    if (fd >= 0) return fd;
+    bool has_lower = false;
+    for (int i = 0; path[i]; i++) {
+        if (path[i] >= 'a' && path[i] <= 'z') { has_lower = true; break; }
+    }
+    if (!has_lower) return -1;
+    char up[256];
+    int n = 0;
+    while (path[n] && n < 255) {
+        char c = path[n];
+        up[n] = (c >= 'a' && c <= 'z') ? c - 32 : c;
+        n++;
+    }
+    up[n] = 0;
+    return fd_create(up);
+}
+
 int fd_read(int fd, void* buf, uint32_t size) {
     if (fd < 0 || fd >= FD_MAX || !fds[fd].used) return -1;
     uint8_t* dst = (uint8_t*)buf;

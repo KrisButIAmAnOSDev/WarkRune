@@ -226,50 +226,6 @@ static void to_upper(char* dst, const char* src) {
     dst[i] = 0;
 }
 
-static int fat12_open_case(const char* path) {
-    int fd = fat12_open(path);
-    if (fd >= 0) return fd;
-    char up[256];
-    to_upper(up, path);
-    return fat12_open(up);
-}
-
-static bool fat12_delete_case(const char* path) {
-    if (fat12_delete(path)) return true;
-    char up[256];
-    to_upper(up, path);
-    return fat12_delete(up);
-}
-
-static bool fat12_rmdir_case(const char* path) {
-    if (fat12_rmdir(path)) return true;
-    char up[256];
-    to_upper(up, path);
-    return fat12_rmdir(up);
-}
-
-static bool fat12_mkdir_case(const char* path) {
-    if (fat12_mkdir(path)) return true;
-    char up[256];
-    to_upper(up, path);
-    return fat12_mkdir(up);
-}
-
-static int fat12_create_case(const char* path) {
-    int fd = fat12_create(path);
-    if (fd >= 0) return fd;
-    char up[256];
-    to_upper(up, path);
-    return fat12_create(up);
-}
-
-static bool fat12_ls_case(const char* path, void (*cb)(const char*, uint32_t, bool)) {
-    if (fat12_ls(path, cb)) return true;
-    char up[256];
-    to_upper(up, path);
-    return fat12_ls(up, cb);
-}
-
 static bool has_lower_alpha(const char* s) {
     for (int i = 0; s && s[i]; i++) {
         if (s[i] >= 'a' && s[i] <= 'z') return true;
@@ -277,8 +233,49 @@ static bool has_lower_alpha(const char* s) {
     return false;
 }
 
-static void upper_path(char* dst, const char* src) {
-    to_upper(dst, src);
+// Try the fat12 op with the path as-is, then with uppercased version if it has lowercase letters
+static int fat12_open_case(const char* path) {
+    int fd = fat12_open(path);
+    if (fd >= 0) return fd;
+    if (!has_lower_alpha(path)) return -1;
+    char up[256]; to_upper(up, path);
+    return fat12_open(up);
+}
+
+static bool fat12_delete_case(const char* path) {
+    if (fat12_delete(path)) return true;
+    if (!has_lower_alpha(path)) return false;
+    char up[256]; to_upper(up, path);
+    return fat12_delete(up);
+}
+
+static bool fat12_rmdir_case(const char* path) {
+    if (fat12_rmdir(path)) return true;
+    if (!has_lower_alpha(path)) return false;
+    char up[256]; to_upper(up, path);
+    return fat12_rmdir(up);
+}
+
+static bool fat12_mkdir_case(const char* path) {
+    if (fat12_mkdir(path)) return true;
+    if (!has_lower_alpha(path)) return false;
+    char up[256]; to_upper(up, path);
+    return fat12_mkdir(up);
+}
+
+static int fat12_create_case(const char* path) {
+    int fd = fat12_create(path);
+    if (fd >= 0) return fd;
+    if (!has_lower_alpha(path)) return -1;
+    char up[256]; to_upper(up, path);
+    return fat12_create(up);
+}
+
+static bool fat12_ls_case(const char* path, void (*cb)(const char*, uint32_t, bool)) {
+    if (fat12_ls(path, cb)) return true;
+    if (!has_lower_alpha(path)) return false;
+    char up[256]; to_upper(up, path);
+    return fat12_ls(up, cb);
 }
 
 static void dispatch(const char* input) {
@@ -348,12 +345,7 @@ static void dispatch(const char* input) {
         if (!args || args[0] == 0) { shell_puts("usage: mkdir <name>", COL_ERR); fb_present(); return; }
         char path[256];
         build_path(path, args);
-        bool ok = fat12_mkdir(path);
-        if (!ok && has_lower_alpha(path)) {
-            char up[256];
-            upper_path(up, path);
-            ok = fat12_mkdir(up);
-        }
+        bool ok = fat12_mkdir_case(path);
         shell_puts(ok ? "ok" : "mkdir: failed", ok ? COL_OK : COL_ERR);
         fb_present();
         return;
@@ -363,12 +355,7 @@ static void dispatch(const char* input) {
         if (!args || args[0] == 0) { shell_puts("usage: touch <name>", COL_ERR); fb_present(); return; }
         char path[256];
         build_path(path, args);
-        int fd = fat12_create(path);
-        if (fd < 0 && has_lower_alpha(path)) {
-            char up[256];
-            upper_path(up, path);
-            fd = fat12_create(up);
-        }
+        int fd = fat12_create_case(path);
         if (fd >= 0) { fat12_close(fd); shell_puts("ok", COL_OK); }
         else shell_puts("touch: failed", COL_ERR);
         fb_present();
@@ -379,12 +366,7 @@ static void dispatch(const char* input) {
         if (!args || args[0] == 0) { shell_puts("usage: rm <file>", COL_ERR); fb_present(); return; }
         char path[256];
         build_path(path, args);
-        bool ok = fat12_delete(path);
-        if (!ok && has_lower_alpha(path)) {
-            char up[256];
-            upper_path(up, path);
-            ok = fat12_delete(up);
-        }
+        bool ok = fat12_delete_case(path);
         shell_puts(ok ? "ok" : "rm: failed", ok ? COL_OK : COL_ERR);
         fb_present();
         return;
@@ -394,12 +376,7 @@ static void dispatch(const char* input) {
         if (!args || args[0] == 0) { shell_puts("usage: rmdir <dir>", COL_ERR); fb_present(); return; }
         char path[256];
         build_path(path, args);
-        bool ok = fat12_rmdir(path);
-        if (!ok && has_lower_alpha(path)) {
-            char up[256];
-            upper_path(up, path);
-            ok = fat12_rmdir(up);
-        }
+        bool ok = fat12_rmdir_case(path);
         shell_puts(ok ? "ok" : "rmdir: not empty", ok ? COL_OK : COL_ERR);
         fb_present();
         return;
@@ -423,12 +400,7 @@ static void dispatch(const char* input) {
         }
         char path[256];
         build_path(path, args);
-        int fd = fat12_open(path);
-        if (fd < 0 && has_lower_alpha(path)) {
-            char up[256];
-            upper_path(up, path);
-            fd = fat12_open(up);
-        }
+        int fd = fat12_open_case(path);
         if (fd < 0) { shell_puts("cat: not found", COL_ERR); fb_present(); return; }
         char buf[512];
         int n;
@@ -501,11 +473,7 @@ static void run_pipeline(const char* input) {
         if (left[0] == 0) { shell_puts("syntax: missing command before >", COL_ERR); fb_present(); return; }
         if (right[0] == 0) { shell_puts("syntax: missing filename after >", COL_ERR); fb_present(); return; }
 
-        int file_fd = fd_create(right);
-        if (file_fd < 0 && has_lower_alpha(right)) {
-            char up[256]; upper_path(up, right);
-            file_fd = fd_create(up);
-        }
+        int file_fd = fd_create_case(right);
         if (file_fd < 0) { shell_puts("redirect: cannot create file", COL_ERR); fb_present(); return; }
         g_out_fd = file_fd;
         dispatch(left);
@@ -573,11 +541,7 @@ static void run_pipeline(const char* input) {
     fname[p] = 0;
     while (m > 0 && cmd2[m-1] == ' ') cmd2[--m] = 0;
 
-    int file_fd = fd_create(fname);
-    if (file_fd < 0 && has_lower_alpha(fname)) {
-        char up[256]; upper_path(up, fname);
-        file_fd = fd_create(up);
-    }
+    int file_fd = fd_create_case(fname);
     if (file_fd < 0) { shell_puts("redirect: cannot create file", COL_ERR); fb_present(); return; }
 
     int rfd, wfd;
@@ -713,7 +677,6 @@ static void cmd_fat12_test() {
         else
             ksnprintf(buf, sizeof(buf), "  [FILE] %s (%u bytes)", name, size);
         shell_puts(buf, COL_FG);
-        (void)buf;
     });
     fb_present();
 
@@ -780,11 +743,8 @@ static void cmd_fat12_test() {
         else
             ksnprintf(buf, sizeof(buf), "  [FILE] %s (%u bytes)", name, size);
         shell_puts(buf, COL_FG);
-        (void)buf;
     });
     fb_present();
-
-    shell_puts("--- FAT12 test done ---", COL_INFO);
 }
 
 static void cmd_freedom() {
